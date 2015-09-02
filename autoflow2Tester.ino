@@ -12,61 +12,111 @@
 
   Property of Creasefield Ltd. Do not copy or modify without permission.
 
-  Checks the following
-
-  1)Pack voltage is between 7.2 and 7.4V
-  2)Temperature between 5 and 35
-  3)Thermistor temperature reading within 2C of TI temperature
-  4)Average current between -2 and 2mA
-  5)State of Charge between 20% and 60%
-  6)Firmware equals to the one defined
-
-
   @section  HISTORY
 
-    v1.0-a1  - Alpha
+    v1.0-a1  - 25/08/2015 - Alpha build
+    v1.0-a2  - 01/09/2015 - Replaced recursion fuction
   *********************************************************
   *IMPORTANT*   FOR USE WITH BQ34Z100-G1 ONLY   *IMPORTANT*
   *********************************************************
 */
 /**************************************************************************/
-
-#include <Wire.h>                                                              
+// Libraries
+#include <Wire.h>
 #include <Adafruit_INA219.h>
 Adafruit_INA219 ina219;
 
+// Function Declaration
+float measureVoltage();
+void compareVoltage();
+void print_title();
+void readSOC();
+void i2cTest();
+void readRemainingCapacity();
+void readVoltage();
+void readFirmware();
+void readAverageCurrent();
+void readInstCurrent();
+void shortCircuit();
+void readBattTemp();
+void measureTherm();
+void sealPack();
+void readDivider();
+void calibrateVoltage(float i2cVoltage, float inaVoltage);
+void failCheck();
 
-/*=========================================================================
-    I2C ADDRESS/BITS
-    -----------------------------------------------------------------------*/
-#define BQ34Z100                                   85     // I2C adress for BQ34Z100                                                                    
-#define FLASHVERSION                               0xAAAA // Check DF version against this. Fails if not equal
-/*=========================================================================*/
+// Constants
+#define BQ34Z100 85                                                  // I2C adress for BQ34Z100                                                                    
+#define FLASHVERSION 0xAAAA                                          // Check DF version matches this. Fails if not equal
+#define mosfetPIN 2
+const float c1 = 0.001134508, c2 = 0.000233318, c3 = 9.0327E-8;      // Steinhart & Hart Co-efficients
+const float R = 14870;                                               // 
 
-/*=========================================================================
-    Variables
-    -----------------------------------------------------------------------*/
-float R = 14870; // Fixed resistance in the voltage divider
-float logRt, Rt, T;
-float inaVoltage;
+// Global Variables
+float inaVoltage, i2cVoltage;
 int divider;
 int flashbytes[32] = {0};
-float c1 = 0.001134508, c2 = 0.000233318, c3 = 9.0327E-8;
-unsigned int soc, i2cVoltage, remain_cap;
-unsigned int inst_current_lsb, inst_current_msb;
-unsigned int firmware_msb, firmware_lsb, firmware;
-int inst_current, c;
-int avg_current, batt_temp, cntrl_stat1, cntrl_stat2;
-float power_draw;
-float reading;
-/*=========================================================================*/
+int batt_temp;
+uint8_t error = 0, fail = 0, calAttempts = 0;
 
+//! Initialize Arduino
+void setup()
+{
+  Serial.begin(9600);
+  uint32_t currentFrequency;
+  ina219.begin();
+  Wire.begin();
+  pinMode(mosfetPIN,OUTPUT);
+}
 
-/**************************************************************************/
-/*
-    @brief  Reads the state of charge over I2C
-*/
-/**************************************************************************/
+//! Repeats Arduino loop
+void loop()
+
+{
+  fail = 0;
+  calAttempts = 0;
+  error = 0;
+  /* loop until i2c available */
+  while (error != 0)
+    i2cTest();
+  delay(4000);
+  readVoltage(); // Reads voltage, calibrates when needed.
+  measureVoltage();
+  compareVoltage();
+  readSOC(); 
+  shortCircuit();
+  readFirmware();
+  readBattTemp();
+  measureTherm();
+  failCheck();
+  /* loop until i2c unavailable (ie. pack unplugged) */
+  while (error == 0) 
+    i2cTest();
+}
+
+float measureVoltage()
+{
+  float busvoltage = ina219.getBusVoltage_V();      // Voltage across Vin- and Gnd
+  float shuntvoltage = ina219.getShuntVoltage_mV(); // Voltage across Vin+ and Vin-
+  
+  inaVoltage = busvoltage + (shuntvoltage / 1000);
+  Serial.print("Shunt Voltage :"); Serial.println(shuntvoltage);
+  Serial.print("Bus Voltage :"); Serial.println(busvoltage);
+  Serial.print("Total Voltage :");Serial.println(inaVoltage);
+}
+
+void print_title()
+{
+  Serial.println(F("\n*****************************************************************"));
+  Serial.print(F("*                                                               *\n"));
+  Serial.print(F("*                                                               *\n"));
+  Serial.print(F("*            hello world                                        *\n"));
+  Serial.print(F("*                                                               *\n"));
+  Serial.print(F("*                                                               *\n"));
+  Serial.print(F("*                                                               *\n"));
+  Serial.print(F("*****************************************************************\n"));
+}
+/* Reads the state of charge over I2C */
 void readSOC() {
   Wire.beginTransmission(BQ34Z100);
   Wire.write(0x02);
@@ -74,14 +124,26 @@ void readSOC() {
 
   Wire.requestFrom(BQ34Z100, 1);
 
-  soc = Wire.read();
+  int soc = Wire.read();
+
+  Serial.print("Battery Charge: ");
+  Serial.print(soc);
+  Serial.println("%");
+
+  if (soc < 20 || soc > 60)
+  {
+    fail++;
+    Serial.println("SOC FAIL");
+  }
 }
 
-/**************************************************************************/
-/*
-    @brief  Read Remaining Capacitor of pack over I2C
-*/
-/**************************************************************************/
+/* Checks for i2c, error = 0 when i2c is avaliable */
+void i2cTest() {
+  Wire.beginTransmission(BQ34Z100);
+  error = Wire.endTransmission();
+  delay(500);
+}
+
 void readRemainingCapacity()
 {
   Wire.beginTransmission(BQ34Z100);
@@ -102,7 +164,7 @@ void readRemainingCapacity()
 
   unsigned int high1 = high << 8;
 
-  remain_cap = high1 + low;
+  int remain_cap = high1 + low;
 }
 
 void readVoltage()
@@ -127,6 +189,31 @@ void readVoltage()
 
   i2cVoltage = high1 + low;
 
+  Serial.print("I2C Voltage Reading: ");
+  Serial.print(i2cVoltage);
+  Serial.println(" mV");
+  
+  if (i2cVoltage < 7200 || i2cVoltage > 7600)
+  {
+    fail++;
+    Serial.println("VOLTAGE FAIL");
+  }
+}
+void compareVoltage()
+{
+   while ( i2cVoltage - inaVoltage > 20 || i2cVoltage - inaVoltage < -20)
+  {
+    if ( calAttempts > 2)
+    {
+      fail++;
+      return;
+    }
+    readVoltage();
+    measureVoltage();
+    calibrateVoltage(i2cVoltage, inaVoltage);
+    calAttempts++;
+    delay(500);
+  } 
 }
 
 void readFirmware()
@@ -145,16 +232,67 @@ void readFirmware()
   Wire.write(0x01);
   Wire.endTransmission();
   Wire.requestFrom(BQ34Z100, 1);
-  firmware_msb = Wire.read();
+  int firmware_msb = Wire.read();
 
   Wire.beginTransmission(BQ34Z100);
   Wire.write(0x00);
   Wire.endTransmission();
   Wire.requestFrom(BQ34Z100, 1);
-  firmware_lsb = Wire.read();
+  int firmware_lsb = Wire.read();
 
   firmware_msb = firmware_msb << 8;
-  firmware = firmware_lsb + firmware_msb;
+  unsigned int firmware = firmware_lsb + firmware_msb;
+
+  Serial.print("Flash version: ");
+  Serial.println(firmware, HEX);
+
+  if (firmware != FLASHVERSION) {
+    fail++;
+    Serial.println("FIRMWARE FAIL");
+  }
+
+}
+
+void readAverageCurrent()
+{
+  Wire.beginTransmission(BQ34Z100);
+  Wire.write(0x0a);
+  Wire.endTransmission();
+
+  Wire.requestFrom(BQ34Z100, 1);
+
+  unsigned int low = Wire.read();
+
+  Wire.beginTransmission(BQ34Z100);
+  Wire.write(0x0b);
+  Wire.endTransmission();
+
+  Wire.requestFrom(BQ34Z100, 1);
+
+  unsigned int high = Wire.read();
+
+  unsigned int high1 = high << 8;
+
+  int avg_current = high1 + low;
+
+  Serial.print("Average Current Draw: ");
+  Serial.print(avg_current);
+  Serial.println(" mA");
+
+  if (avg_current > 2 || avg_current < -2)
+  {
+    fail++;
+    Serial.println("CURRENT FAIL");
+  }
+}
+
+void shortCircuit()
+{
+  digitalWrite(mosfetPIN, HIGH);
+  delay(6000);
+  readInstCurrent();
+  delay(1000);
+  digitalWrite(mosfetPIN, LOW);
 }
 
 void readInstCurrent()
@@ -174,17 +312,17 @@ void readInstCurrent()
   Wire.write(0x01);
   Wire.endTransmission();
   Wire.requestFrom(BQ34Z100, 1);
-  inst_current_lsb = Wire.read();
+  unsigned int inst_current_lsb = Wire.read();
 
   Wire.beginTransmission(BQ34Z100);
   Wire.write(0x00);
   Wire.endTransmission();
   Wire.requestFrom(BQ34Z100, 1);
-  inst_current_msb = Wire.read();
+  unsigned int inst_current_msb = Wire.read();
 
   unsigned int temp = inst_current_msb << 8;
 
-  inst_current = temp + inst_current_lsb;
+  unsigned int inst_current = temp + inst_current_lsb;
 }
 
 void readBattTemp() {
@@ -210,6 +348,33 @@ void readBattTemp() {
 
   batt_temp = 0.1 * batt_temp;        // Each bit is 0.1K, so we have a value in Kelvins
   batt_temp = batt_temp - 273.15;      // Convert to degrees Celsius
+
+  Serial.print("Battery Temperature: ");
+  Serial.print(batt_temp);
+  Serial.println(" C");
+  if (batt_temp > 35 || batt_temp < 5)
+  {
+    fail++;
+    Serial.println("TEMPERATURE FAIL");
+  }
+}
+
+void measureTherm()
+{
+  float R, logRt;
+  float Vo = analogRead(A0);
+  float Rt = R * ( 1023.0 / (float)Vo - 1.0 );
+  logRt = log(Rt);
+  float T = ( 1.0 / (c1 + c2 * logRt + c3 * logRt * logRt * logRt ) ) - 273.15;
+  Serial.print("Thermistor Temperature: ");
+  Serial.print(" "); Serial.println(T);
+
+  T = batt_temp - T;
+  if (T > 2 || T < -2)
+  {
+    fail++;
+    Serial.println("THERMISTOR FAIL");
+  }
 }
 
 void sealPack()
@@ -220,23 +385,6 @@ void sealPack()
   Wire.write(0x00);
   delay(10);
   Wire.endTransmission();
-}
-
-float PowerDraw(float volt, float current)
-{
-  volt = volt / 1000.0;
-  current = current / 1000.0;
-  float power = volt * current;
-  return power;
-}
-
-float measureVoltage()
-{
-  float shuntvoltage = 0;
-  float busvoltage = 0;
-  shuntvoltage = ina219.getShuntVoltage_mV(); // Voltage across Vin+ and Vin-
-  busvoltage = ina219.getBusVoltage_V();      // Voltage across Vin- and Gnd
-  inaVoltage = busvoltage + (shuntvoltage / 1000);
 }
 
 void readDivider()
@@ -280,7 +428,6 @@ void calibrateVoltage(float i2cVoltage, float inaVoltage)
   divider = divider * inaVoltage / i2cVoltage;
   Serial.print("Divider should be: ");
   Serial.println(divider);
-  //
   int  byte = divider & 0xFF;
   Serial.print("byte: ");
   Serial.println(byte, HEX);
@@ -317,106 +464,8 @@ void calibrateVoltage(float i2cVoltage, float inaVoltage)
   readDivider();
 }
 
-void setup()
+void failCheck()
 {
-  Serial.begin(9600);
-  uint32_t currentFrequency;
-  ina219.begin();
-  Wire.begin();
-}
-
-void loop()
-{
-  uint8_t fail = 0;
-  uint8_t calAttempts = 0;
-  inaVoltage = 0;
-
-  while (inaVoltage < 200)
-  {
-    measureVoltage();
-    delay(500);
-  }
-  readVoltage();
-  Serial.print("Battery Pack Voltage: ");
-  Serial.print(i2cVoltage);
-  Serial.println(" mV");
-
-  while (i2cVoltage - inaVoltage > 20 || i2cVoltage - inaVoltage < -20 && calAttempts < 5)
-  {
-    readVoltage();
-    measureVoltage();
-    calibrateVoltage(i2cVoltage, inaVoltage);
-    calAttempts++;
-  }
-
-  if (i2cVoltage < 7200 || i2cVoltage > 7600)
-  {
-    fail++;
-    Serial.println("VOLTAGE FAIL");
-  }
-
-  
-  readSOC(); //Read State of Charge
-  Serial.print("Battery Charge: ");
-  Serial.print(soc);
-  Serial.println("%");
-
-  if (soc < 20 || soc > 60)
-  {
-    fail++;
-    Serial.println("SOC FAIL");
-  }
-//
-//  readAverageCurrent();
-//  Serial.print("Average Current Draw: ");
-//  Serial.print(avg_current);
-//  Serial.println(" mA");
-//
-//  if (avg_current > 2 || avg_current < -2)
-//  {
-//    fail++;
-//    Serial.println("CURRENT FAIL");
-//  }
-//
-//  readInstCurrent();
-//  Serial.print("Instantaneous Current Draw: ");
-//  Serial.println(inst_current);
-//
-//  readFirmware();
-//  Serial.print("Flash version: ");
-//  Serial.println(firmware, HEX);
-//
-//  if (firmware != FLASHVERSION) {
-//    fail++;
-//    Serial.println("FIRMWARE FAIL");
-//  }
-//
-//
-  readBattTemp();
-  Serial.print("Battery Temperature: ");
-  Serial.print(batt_temp);
-  Serial.println(" C");
-  if (batt_temp > 35 || batt_temp < 5)
-  {
-    fail++;
-    Serial.println("TEMPERATURE FAIL");
-  }
-
-  int Vo;
-  Vo = analogRead(A0);
-  Rt = R * ( 1023.0 / (float)Vo - 1.0 );
-  logRt = log(Rt);
-  T = ( 1.0 / (c1 + c2 * logRt + c3 * logRt * logRt * logRt ) ) - 273.15;
-  Serial.print("Thermistor Temperature: ");
-  Serial.print(" "); Serial.println(T);
-
-  T = batt_temp - T;
-  if (T > 2 || T < -2)
-  {
-    fail++;
-    Serial.println("THERMISTOR FAIL");
-  }
-
   Serial.print("Number of Fails: ");
   Serial.println(fail);
   Serial.println("------------------------------------------------");
@@ -427,15 +476,5 @@ void loop()
     Serial.print("All test passed... Sealing packing");
     sealPack();
   }
-  for (c = 0; c < fail; c++)
-  {
-    digitalWrite(11, HIGH);
-    delay(200);
-    digitalWrite(11, LOW);
-    delay(200);
-  }
-  digitalWrite(11, HIGH);
-  
 
 }
-
